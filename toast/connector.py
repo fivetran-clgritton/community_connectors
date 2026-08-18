@@ -562,6 +562,24 @@ def process_child(parent, table_name, id_field_name, id_field):
                 if len(p.get(child_key, [])) > 0:  # Use .get() to handle missing keys gracefully
                     process_child(p[child_key], child_table_name, table_name + "_id", p["guid"])
                 p.pop(child_key, None)
+        # Toast modifiers are recursive: a modifier can itself carry its own "modifiers" list
+        # (e.g. a pour-size modifier nesting a liquor-brand upgrade modifier). The generic
+        # `relationships` map above can't express this directly -- a self-referential entry
+        # there would rename the FK at each nesting level (table_name + "_id"), but nested
+        # modifiers need to keep the SAME top-level orders_check_selection_id as their
+        # ancestors. Recurse into the same table at any depth, propagating the same
+        # id_field_name/id_field this call received, and record each nested modifier's
+        # immediate parent separately via parent_modifier_id (absent/None for the non-nested
+        # case). Without this, a nested modifier's entire "modifiers" list got stringified into
+        # a MODIFIERS text blob by stringify_lists() below instead of getting its own row.
+        if table_name == "orders_check_selection_modifier":
+            nested_modifiers = p.pop("modifiers", None)
+            if nested_modifiers:
+                for nested in nested_modifiers:
+                    nested["parent_modifier_id"] = p["guid"]
+                process_child(
+                    nested_modifiers, "orders_check_selection_modifier", id_field_name, id_field
+                )
         if table_name in fields_to_flatten:
             # log.debug(f"flattening fields in {table_name}")
             p = flatten_fields(fields_to_flatten[table_name], p)
