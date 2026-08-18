@@ -13,7 +13,7 @@ import time
 import json
 import copy
 import uuid
-from cryptography.fernet import Fernet
+import os  # For reading FIVETRAN_CONNECTION_ID / FIVETRAN_DEPLOYMENT_MODEL at runtime
 
 # Import required classes from fivetran_connector_sdk.
 # For supporting Connector operations like Update() and Schema()
@@ -24,6 +24,10 @@ from fivetran_connector_sdk import Logging as log
 
 # For supporting Data operations like Upsert(), Update(), Delete() and checkpoint()
 from fivetran_connector_sdk import Operations as op
+
+__FIVETRAN_CONNECTIONS_URL = "https://api.fivetran.com/v1/connections"
+__TOKEN_REFRESH_BUFFER_SECONDS = 3600  # Refresh the token if less than an hour of validity remains
+__CONFIG_UPDATE_MAX_RETRIES = 3
 
 
 def update(configuration: dict, state: dict):
@@ -39,8 +43,7 @@ def update(configuration: dict, state: dict):
     try:
         domain = configuration["domain"]
         base_url = f"https://{domain}"
-        key = configuration["key"]
-        headers, state = make_headers(configuration, base_url, state, key)
+        headers = make_headers(configuration, base_url, state)
 
         start_timestamp = (
             datetime.now(timezone.utc).isoformat("T", "milliseconds").replace("+00:00", "Z")
@@ -204,14 +207,14 @@ def process_config(base_url, headers, endpoint, table_name, rst_id, timerange):
 
     while more_data:
         try:
-            param_string = "&".join(f"{key}={value}" for key, value in timerange.items())
+            params = {**timerange, **pagination}
             response_page, next_token = get_api_response(
-                base_url + endpoint + "?" + param_string, headers, params=pagination
+                base_url + endpoint, headers, params=params
             )
             log.debug(
-                f"restaurant {rst_id}: response_page has {len(response_page)} items for {endpoint}"
+                f"restaurant {rst_id}: response_page has {len(response_page or [])} items for {endpoint}"
             )
-            for o in response_page:
+            for o in response_page or []:
                 if fields_to_extract.get(table_name):
                     o = extract_fields(fields_to_extract[table_name], o)
                 o = stringify_lists(o)
@@ -268,10 +271,10 @@ def process_labor(base_url, headers, endpoint, table_name, rst_id, params=None):
     try:
         response_page, next_token = get_api_response(base_url + endpoint, headers, params=params)
         log.debug(
-            f"restaurant {rst_id}: response_page has {len(response_page)} items for {endpoint}"
+            f"restaurant {rst_id}: response_page has {len(response_page or [])} items for {endpoint}"
         )
 
-        for o in response_page:
+        for o in response_page or []:
             if endpoint == "/labor/v1/timeEntries" and o.get("breaks"):
                 process_child(o["breaks"], "break", "time_entry_id", o["guid"])
             elif endpoint == "/labor/v1/employees":
@@ -342,8 +345,7 @@ def process_cash(base_url, headers, endpoint, table_name, rst_id, params):
             response_page, next_token = get_api_response(
                 base_url + endpoint + "?businessDate=" + d, headers
             )
-            # log.debug(f"restaurant {rst_id}: response_page has {len(response_page)} items for {endpoint}")
-            for o in response_page:
+            for o in response_page or []:
                 o = flatten_fields(fields_to_flatten[table_name], o)
                 o["restaurant_id"] = rst_id
                 o = replace_guid_with_id(o)
@@ -563,9 +565,14 @@ def process_child(parent, table_name, id_field_name, id_field):
         if table_name in fields_to_flatten:
             # log.debug(f"flattening fields in {table_name}")
             p = flatten_fields(fields_to_flatten[table_name], p)
-        # check for null guids in appliedTaxes[]
-        if table_name == "orders_check_selection_applied_tax" and p.get("guid") is None:
-            p["guid"] = "gen-" + str(uuid.uuid4())
+        # Toast sometimes omits a guid for appliedTaxes[] entries. flatten_fields() above has
+        # already renamed any real guid to "id", so check "id" (not "guid", which no longer
+        # exists at this point) and generate a deterministic id from stable fields -- not a
+        # random uuid4 -- so the same tax line gets the same id on every sync instead of a new
+        # duplicate row each time.
+        if table_name == "orders_check_selection_applied_tax" and p.get("id") is None:
+            basis = f"{id_field}-{p.get('taxRate_id', '')}"
+            p["id"] = "gen-" + str(uuid.uuid5(uuid.NAMESPACE_OID, basis))
         if table_name == "orders_check":
             p.pop("payments", None)
         p = stringify_lists(p)
@@ -598,66 +605,164 @@ def process_void_info(payment):
         payment.pop("voidInfo", None)
 
 
-def make_headers(conf, base_url, state, key):
+def make_headers(configuration, base_url, state):
     """
-    Create authentication headers, reusing a cached token if possible.
+    Create authentication headers, reusing the token cached in `configuration` if it still has
+    over an hour of validity left; otherwise logs in to Toast and persists the refreshed token
+    back to this connection's configuration via the Fivetran REST API, so future syncs can reuse
+    it instead of logging in again every time.
 
-    :param conf: Dictionary containing authentication details.
-    :param base_url: Base URL of the API.
-    :param state: Dictionary storing token and expiration details.
-    :param key: Encryption key (Fernet) used for token encryption/decryption.
-    :return: Tuple (headers, updated_state)
+    The token itself lives in `configuration` (which Fivetran encrypts at rest) rather than
+    `state`. `state` only tracks `token_expires_at`, a plain timestamp used to decide whether to
+    reuse or refresh -- not a secret, so it's fine to leave unencrypted in state.
+
+    :param configuration: Dictionary containing clientId, clientSecret, userAccessType,
+        fivetran_api_key, and (once refreshed at least once) token.
+    :param base_url: Base URL of the Toast API.
+    :param state: Dictionary storing token_expires_at.
+    :return: headers dict for authenticated Toast API calls.
     """
-    fernet = Fernet(key)
     current_time = time.time()
+    token_expires_at = state.get("token_expires_at") or 0  # 0 if never refreshed yet
+    cached_token = configuration.get("token")
+    token_still_valid = token_expires_at > current_time + __TOKEN_REFRESH_BUFFER_SECONDS
 
-    # Check if a valid token exists and is not expiring in the next hour
-    if (
-        "encrypted_token" in state
-        and "token_ttl" in state
-        and state["token_ttl"] > current_time + 3600
-    ):
-        try:
-            auth_token = fernet.decrypt(state["encrypted_token"].encode()).decode()
-            log.info("encrypted_token found with at least an hour left, reusing")
-            return {"Authorization": f"Bearer {auth_token}", "Accept": "application/json"}, state
-        except Exception as e:
-            print(f"⚠️ Token decryption failed: {e}, re-authenticating...")
+    # Reuse the cached token if it still has over an hour of validity left.
+    if cached_token and token_still_valid:
+        log.info("Token from configuration still has over an hour left, reusing")
+        return {"Authorization": f"Bearer {cached_token}", "Accept": "application/json"}
 
-    # No valid token OR token expiring within 1 hour, request a new one
+    # No valid token, or it's expiring within the hour -- log in and get a new one.
     payload = {
-        "clientId": conf.get("clientId"),
-        "clientSecret": conf.get("clientSecret"),
-        "userAccessType": conf.get("userAccessType"),
+        "clientId": configuration.get("clientId"),
+        "clientSecret": configuration.get("clientSecret"),
+        "userAccessType": configuration.get("userAccessType"),
     }
 
     try:
-        log.info("encrypted_token not found in state or is expiring soon, requesting new token")
+        log.info("Token missing or expiring soon, requesting new token")
         auth_response = rq.post(
             f"{base_url}/authentication/v1/authentication/login", json=payload, timeout=10
         )
         auth_response.raise_for_status()
         auth_page = auth_response.json()
 
-        # Extract token safely
-        auth_token = auth_page.get("token", {}).get("accessToken")
+        new_token = auth_page.get("token", {}).get("accessToken")
         token_expiry = auth_page.get("token", {}).get("expiresIn", 3600)  # Default to 1 hour
 
-        if not auth_token:
+        if not new_token:
             raise ValueError("Authentication failed: accessToken missing in response")
 
-        # Encrypt and store the new token
-        try:
-            encrypted_token = fernet.encrypt(auth_token.encode()).decode()
-            state["encrypted_token"] = encrypted_token
-            state["token_ttl"] = current_time + token_expiry  # Store expiry timestamp
-        except Exception as enc_error:
-            print(f"⚠️ Token encryption failed: {enc_error}. Proceeding without storing.")
+        # Persist the new token to this connection's configuration via the Fivetran REST API,
+        # so the next sync can reuse it instead of logging in again.
+        configuration["token"] = new_token
+        update_configuration(configuration)
+        state["token_expires_at"] = current_time + token_expiry
 
-        return {"Authorization": f"Bearer {auth_token}", "Accept": "application/json"}, state
+        return {"Authorization": f"Bearer {new_token}", "Accept": "application/json"}
 
     except rq.exceptions.RequestException as e:
-        raise RuntimeError(f"❌ Failed to authenticate: {e}")
+        raise RuntimeError(f"Failed to authenticate: {e}")
+
+
+def update_configuration(configuration):
+    """
+    Persist `configuration` (including the freshly-refreshed token) back to this connection via
+    the Fivetran REST API. The entire configuration must be passed as the payload -- it
+    overrides all keys present. See the Fivetran REST API documentation:
+    https://fivetran.com/docs/rest-api/api-reference/connections/modify-connection?service=connector_sdk
+
+    Skips the live call during `fivetran debug`, since FIVETRAN_CONNECTION_ID is a placeholder
+    there and there's no real Fivetran API key to authenticate with -- logs the config key names
+    that would have been sent instead (never the values, since configuration holds secrets like
+    clientSecret, fivetran_api_key, and token).
+
+    Retries transient failures (429, 5xx, connection errors/timeouts) with backoff. Raises
+    immediately on other 4xx responses (e.g. an invalid fivetran_api_key or a wrong connection
+    id) since those won't resolve on retry.
+
+    :param configuration: dictionary containing the full connector configuration, including the
+        new token.
+    """
+    connection_id = os.environ.get("FIVETRAN_CONNECTION_ID")
+    update_url = f"{__FIVETRAN_CONNECTIONS_URL}/{connection_id}"
+    payload = {
+        "config": {
+            "secrets_list": [
+                {"key": str(key), "value": str(value)} for key, value in configuration.items()
+            ]
+        }
+    }
+
+    if os.environ.get("FIVETRAN_DEPLOYMENT_MODEL") == "local_debug":
+        updated_keys = [entry["key"] for entry in payload["config"]["secrets_list"]]
+        log.info(
+            f"[local_debug] Skipping Fivetran REST API call. Would have PATCHed {update_url} "
+            f"with keys: {updated_keys}"
+        )
+        return
+
+    headers = {
+        "Accept": "application/json;version=2",
+        "Authorization": f"Basic {configuration.get('fivetran_api_key')}",
+        "content-type": "application/json",
+    }
+
+    for attempt in range(1, __CONFIG_UPDATE_MAX_RETRIES + 1):
+        try:
+            response = rq.patch(update_url, json=payload, headers=headers, timeout=30)
+        except (
+            rq.exceptions.ConnectionError,
+            rq.exceptions.Timeout,
+            rq.exceptions.ChunkedEncodingError,
+        ) as e:
+            if attempt == __CONFIG_UPDATE_MAX_RETRIES:
+                log.error(f"Failed to update configuration after {attempt} attempts: {e}")
+                raise RuntimeError(f"Failed to update configuration via Fivetran REST API: {e}")
+            log.warning(
+                f"Network error updating configuration, attempt {attempt}/{__CONFIG_UPDATE_MAX_RETRIES}, retrying in 30s"
+            )
+            time.sleep(30)
+            continue
+
+        if response.status_code == 429:
+            if attempt == __CONFIG_UPDATE_MAX_RETRIES:
+                log.error(f"Rate limited updating configuration after {attempt} attempts")
+                raise RuntimeError(
+                    "Rate limited by Fivetran REST API while updating configuration"
+                )
+            retry_after = int(response.headers.get("Retry-After", 30))
+            log.warning(f"Rate limited updating configuration, retrying in {retry_after}s")
+            time.sleep(retry_after)
+            continue
+
+        if response.status_code >= 500:
+            if attempt == __CONFIG_UPDATE_MAX_RETRIES:
+                log.error(
+                    f"Fivetran REST API returned {response.status_code} after {attempt} attempts"
+                )
+                raise RuntimeError(
+                    f"Fivetran REST API error {response.status_code} while updating configuration"
+                )
+            log.warning(
+                f"Fivetran REST API returned {response.status_code}, attempt {attempt}/{__CONFIG_UPDATE_MAX_RETRIES}, retrying in 30s"
+            )
+            time.sleep(30)
+            continue
+
+        if response.status_code >= 400:
+            # Non-recoverable: an invalid fivetran_api_key, a wrong connection id, or a
+            # malformed payload. None of these will fix themselves on retry.
+            log.error(
+                f"Fivetran REST API returned {response.status_code} while updating configuration"
+            )
+            raise RuntimeError(
+                f"Failed to update configuration via Fivetran REST API ({response.status_code}) "
+                "-- check that fivetran_api_key is valid and has permission to modify this connection."
+            )
+
+        log.info("Configuration updated successfully with new token")
+        return
 
 
 def is_older_than_30_days(date_to_check):
@@ -908,8 +1013,8 @@ def schema(configuration: dict):
     :param configuration: a dictionary that holds the configuration settings for the connector.
     :return: a list of tables with primary keys and any datatypes that we want to specify
     """
-    if "key" not in configuration:
-        raise ValueError("Could not find 'key' in configs")
+    if "fivetran_api_key" not in configuration:
+        raise ValueError("Could not find 'fivetran_api_key' in configs")
 
     return [
         {"table": "restaurant", "primary_key": ["id"]},
@@ -1102,7 +1207,7 @@ connector = Connector(update=update, schema=schema)
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
 # This is useful for debugging while you write your code. Note this method is not called by Fivetran when executing your connector in production.
 # Please test using the Fivetran debug command prior to finalizing and deploying your connector.
-if __name__ == "main":
+if __name__ == "__main__":
     # Open the configuration.json file and load its contents into a dictionary.
     with open("configuration.json", "r") as f:
         configuration = json.load(f)

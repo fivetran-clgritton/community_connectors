@@ -10,7 +10,7 @@ For full implementation details, see the [Toast connector example code](https://
 
 - Toast API credentials: `clientId`, `clientSecret`, `userAccessType`
 - Domain to connect to (e.g., `api.toasttab.com`)
-- A Fernet key (`key`) for encrypting access tokens
+- A Fivetran REST API key (`fivetran_api_key`) so the connector can persist the refreshed Toast token to this connection's configuration
 - `initialSyncStart` ISO timestamp to define the start of sync window
 - [Supported Python versions](https://github.com/fivetran/community_connectors/blob/main/README.md#requirements)
 
@@ -35,7 +35,7 @@ fivetran init --template toast
 - Includes incremental sync via time-based windowing and state checkpointing
 - Graceful handling of rate limits, authentication, and API errors
 - Supports voids, deletions, and nested child entities
-- Uses Fernet encryption for token security in state
+- Persists refreshed Toast tokens to the connection's configuration via the Fivetran REST API, instead of caching them in state
 
 ## Configuration file
 
@@ -48,7 +48,7 @@ Example `configuration.json`:
   "userAccessType": "TOAST_MACHINE_CLIENT",
   "domain": "ws-api.toasttab.com",
   "initialSyncStart": "2023-01-01T00:00:00.000Z",
-  "key": "your_base64_encoded_fernet_key"
+  "fivetran_api_key": "your_base64_encoded_fivetran_api_key"
 }
 ```
 
@@ -56,18 +56,22 @@ Example `configuration.json`:
 
 ## Requirements file
 
-The connector requires the `cryptography` library for Fernet-based token encryption. Add it to your `requirements.txt`:
-
-```
-cryptography
-```
+The connector does not require any additional packages beyond the pre-installed ones.
 
 > Note: [Some packages](https://fivetran.com/docs/connector-sdk/technical-reference#preinstalledpackages) are pre-installed in the Connector SDK runtime environment. To avoid dependency conflicts, do not declare them in your `requirements.txt`.
+
+## Authentication
+
+Authentication is done via a two-step process:
+- The connector calls Toast's login endpoint with `clientId`/`clientSecret`/`userAccessType` to get a bearer token.
+- The token is written to `configuration["token"]` and persisted to this connection's configuration via the Fivetran REST API (authenticated with `fivetran_api_key`), so future syncs can reuse it instead of logging in again.
+- `state["token_expires_at"]` (a plain timestamp, not a secret) tracks when the cached token needs refreshing. The connector refreshes it once less than an hour of validity remains.
+- When running via `fivetran debug`, the SDK sets the `FIVETRAN_DEPLOYMENT_MODEL` environment variable to `local_debug`. The connector checks for this and skips the live Fivetran REST API call in that case (logging the config key names that would have been sent, never the values), since there is no real connection to update locally.
 
 ## Data handling
 
 The connector performs the following actions for each key aspect:
-- Authentication: Generates and caches a Toast token using the provided credentials
+- Authentication: Logs in to Toast using the provided credentials, then persists the refreshed token to this connection's configuration via the Fivetran REST API (see [Authentication](#authentication))
 - Sync loop: Runs in 30-day time chunks, paginating through endpoints
 - Data normalization: Flattens nested objects and lists using `flatten_dict`, `extract_fields`, and `stringify_lists`
 - Upserts and deletes: Emits operations using `op.upsert()` and `op.delete()`
@@ -79,6 +83,7 @@ The connector performs the following actions for each key aspect:
 - Skips 403 Forbidden
 - Backs off on 429 Too Many Requests
 - Skips on 400 and 409 errors with logging
+- When persisting the refreshed token via the Fivetran REST API: retries transient failures (429, 5xx, connection errors/timeouts) with backoff; raises immediately on other 4xx responses (e.g. an invalid `fivetran_api_key`), since those won't resolve on retry
 
 Uses Fivetran SDK logging levels (`info`, `debug`, `warning`, `error`) for detailed sync visibility.
 
@@ -114,4 +119,4 @@ The examples provided are intended to help you effectively use Fivetran's Connec
 
 - [Fivetran Connector SDK Docs](https://fivetran.com/docs/connectors/connector-sdk)
 - [Toast API Reference](https://doc.toasttab.com/)
-- [Fernet Encryption](https://cryptography.io/en/latest/fernet/)
+- [Fivetran REST API - Modify Connection](https://fivetran.com/docs/rest-api/api-reference/connections/modify-connection?service=connector_sdk)

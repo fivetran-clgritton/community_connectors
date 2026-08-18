@@ -4,5 +4,5 @@
     "userAccessType": "TOAST_MACHINE_CLIENT",
     "domain": "<YOUR_DOMAIN>",
     "initialSyncStart": "<ISO_FORMAT_TIMESTAMP>",
-    "key": "<BASE_64_ENCODED_FERNET_KEY>"
+    "fivetran_api_key": "<YOUR_BASE64_ENCODED_FIVETRAN_API_KEY>"
 }
