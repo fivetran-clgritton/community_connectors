@@ -1,0 +1,7 @@
+{
+  "user_agent": "<YOUR_USER_AGENT>",
+  "area": "<YOUR_STATE_OR_AREA_CODE>",
+  "latitude": "<YOUR_LATITUDE>",
+  "longitude": "<YOUR_LONGITUDE>",
+  "max_forecast_hours": "<MAX_FORECAST_HOURS>"
+}
